@@ -2,14 +2,23 @@
 
 # Process_Events_with_Zenodo.sh
 # Main script to process CASES events and upload to Zenodo
-# Usage: ./Process_Events_with_Zenodo.sh [events_file] [firmware_version] [zenodo_token] [zenodo_title] [zenodo_description]
+# Usage: ./Process_Events_with_Zenodo.sh [events_file] [firmware_version] [zenodo_token] [zenodo_title] [zenodo_description] [bin_type]
 
 EVENTS_FILE=${1:-"List_of_events.txt"}
 FIRMWARE_VERSION=${2:-"gss1400"}
 ZENODO_TOKEN=${3}
 ZENODO_TITLE=${4:-"CASES Scintillation Event Data"}
 ZENODO_DESCRIPTION=${5:-"Processed CASES scintillation event data with IQ, ionospheric, scintillation, navigation, channel, and transmitter information."}
-BASE_PATH="/data1/public/Data/cases/pfrr"
+BIN_TYPE=${6:-"both"}  # Options: "dataout", "dataoutiq", "both"
+# Array of base paths to search for data
+BASE_PATHS=(
+    "/data1/public/Data/cases/pfrr"
+    "/data2/from_usb"
+    "/data2/from_usb2"
+    "/data2/from_usb3"
+    "/data2/from_usb4"
+    "/data2/from_usb6/archive"
+)
 
 # Store the original directory where script was run
 SCRIPT_START_DIR="$(pwd)"
@@ -18,6 +27,7 @@ echo "CASES Data Processing and Zenodo Upload"
 echo "======================================"
 echo "Events file: $EVENTS_FILE"
 echo "Firmware: $FIRMWARE_VERSION"
+echo "Bin file type: $BIN_TYPE"
 echo "Working directory: $SCRIPT_START_DIR"
 echo "Zenodo token: ${ZENODO_TOKEN:+[PROVIDED]}${ZENODO_TOKEN:-[NOT PROVIDED]}"
 echo "Zenodo title: $ZENODO_TITLE"
@@ -26,7 +36,14 @@ echo ""
 # Check required parameters
 if [ -z "$ZENODO_TOKEN" ]; then
     echo "Error: Zenodo token is required"
-    echo "Usage: $0 [events_file] [firmware_version] [zenodo_token] [zenodo_title] [zenodo_description]"
+    echo "Usage: $0 [events_file] [firmware_version] [zenodo_token] [zenodo_title] [zenodo_description] [bin_type]"
+    exit 1
+fi
+
+# Validate BIN_TYPE parameter
+if [[ ! "$BIN_TYPE" =~ ^(dataout|dataoutiq|both)$ ]]; then
+    echo "Error: Invalid bin_type '$BIN_TYPE'. Must be 'dataout', 'dataoutiq', or 'both'"
+    echo "Usage: $0 [events_file] [firmware_version] [zenodo_token] [zenodo_title] [zenodo_description] [bin_type]"
     exit 1
 fi
 
@@ -167,6 +184,71 @@ else
     exit 1
 fi
 
+# Function to find all bin files for a receiver/year/doy across all base paths
+# Returns a list of unique bin files (by name), choosing the largest when duplicates exist
+find_bin_files_all_locations() {
+    local year=$1
+    local doy=$2
+    local receiver=$3
+
+    # Temporary file to track files: filename|size|full_path
+    local temp_file=$(mktemp)
+
+    # Determine which file patterns to search for based on BIN_TYPE
+    local patterns=()
+    case "$BIN_TYPE" in
+        "dataout")
+            patterns=("dataout_*.bin")
+            ;;
+        "dataoutiq")
+            patterns=("dataoutiq_*.bin")
+            ;;
+        "both")
+            patterns=("dataout_*.bin" "dataoutiq_*.bin")
+            ;;
+    esac
+
+    # Search all base paths
+    for base in "${BASE_PATHS[@]}"; do
+        local bin_dir="${base}/${year}/${doy}/${receiver}/bin"
+
+        # Skip if directory doesn't exist
+        if [ ! -d "$bin_dir" ]; then
+            continue
+        fi
+
+        # Check for bin files using the appropriate patterns
+        local found_files=false
+        for pattern in "${patterns[@]}"; do
+            for binfile in "$bin_dir"/$pattern; do
+                if [ -f "$binfile" ]; then
+                    found_files=true
+                    local filename=$(basename "$binfile")
+                    local size=$(stat -c%s "$binfile" 2>/dev/null || stat -f%z "$binfile" 2>/dev/null || echo "0")
+                    echo "${filename}|${size}|${binfile}" >> "$temp_file"
+                fi
+            done
+        done
+
+        if [ "$found_files" = true ]; then
+            log_msg "  Found bin files in: $bin_dir"
+        fi
+    done
+
+    # Process the temp file to find largest version of each unique filename
+    # Sort by filename, then by size (descending), then take first of each filename
+    if [ -s "$temp_file" ]; then
+        sort -t'|' -k1,1 -k2,2rn "$temp_file" | \
+        awk -F'|' '!seen[$1]++ {print $3 "|" $2}' | \
+        while IFS='|' read -r filepath filesize; do
+            log_msg "    Selected: $(basename "$filepath") (${filesize} bytes) from $(dirname "$filepath")"
+            echo "$filepath"
+        done
+    fi
+
+    rm -f "$temp_file"
+}
+
 # Function to upload file to Zenodo bucket
 upload_to_zenodo() {
     local file_path="$1"
@@ -247,32 +329,31 @@ while read -r year doy signal prn start_hour start_min end_hour end_min; do
     for receiver in "${RECEIVERS[@]}"; do
         log_msg ""
         log_msg "Processing receiver: $receiver"
-        
-        # Build path to source data
-        source_bin_dir="$BASE_PATH/$year/$doy_formatted/$receiver/bin"
-        
-        if [ ! -d "$source_bin_dir" ]; then
-            log_msg "Warning: Directory not found: $source_bin_dir"
+
+        # Find all bin files for this receiver/year/doy across all locations
+        log_msg "Searching for bin files across all data locations..."
+        bin_files_found=$(find_bin_files_all_locations "$year" "$doy_formatted" "$receiver")
+
+        if [ -z "$bin_files_found" ]; then
+            log_msg "Warning: No bin files found for $receiver on $year/$doy_formatted"
             continue
         fi
-        
-        # Check for bin files in source directory
-        if ! ls "$source_bin_dir"/dataout_*.bin 1> /dev/null 2>&1; then
-            log_msg "Warning: No bin files found in $source_bin_dir"
-            continue
-        fi
-        
+
         # Process bin files that match time window
         archive_count=0
-        for binfile in "$source_bin_dir"/dataout_*.bin; do
+        while IFS= read -r binfile; do
             if [ -f "$binfile" ]; then
                 filename=$(basename "$binfile")
-                
-                # Extract time from filename
-                if [[ $filename =~ dataout_[0-9]{4}_[0-9]{3}_([0-9]{4})\.bin ]]; then
-                    time_str="${BASH_REMATCH[1]}"
+
+                # Extract time from filename (handle both dataout and dataoutiq)
+                if [[ $filename =~ dataout(iq)?_([0-9]{4})_([0-9]{3})_([0-9]{4})\.bin ]]; then
+                    # BASH_REMATCH[1] = "iq" or empty, [2] = year, [3] = doy, [4] = time
+                    bin_year="${BASH_REMATCH[2]}"
+                    bin_doy="${BASH_REMATCH[3]}"
+                    bin_time="${BASH_REMATCH[4]}"
+                    time_str="$bin_time"
                     file_hour=$((10#${time_str:0:2}))
-                    
+
                     # Check if file hour overlaps with time window
                     in_window=false
                     if [ $file_hour -eq $start_hour ] || [ $file_hour -eq $end_hour ]; then
@@ -280,63 +361,56 @@ while read -r year doy signal prn start_hour start_min end_hour end_min; do
                     elif [ $file_hour -gt $start_hour ] && [ $file_hour -lt $end_hour ]; then
                         in_window=true
                     fi
-                    
+
                     if [ "$in_window" = true ]; then
                         log_msg "  Processing: $filename (hour $file_hour contains window)"
-                        
-                        # Extract components from filename
-                        if [[ $filename =~ dataout_([0-9]{4})_([0-9]{3})_([0-9]{4})\.bin ]]; then
-                            bin_year="${BASH_REMATCH[1]}"
-                            bin_doy="${BASH_REMATCH[2]}"
-                            bin_time="${BASH_REMATCH[3]}"
-                            
-                            # Copy bin file temporarily to working directory
-                            temp_bin="temp_${filename}"
-                            cp "$binfile" "$temp_bin"
-                            
-                            # Run binflate
-                            ./binflate -i "$temp_bin"
-                            
-                            # Collect log files
-                            log_files_created=()
-                            for log_type in iq iono scint navsol channel txinfo; do
-                                if [ -f "${log_type}.log" ]; then
-                                    new_name="${bin_year}_${bin_doy}_${log_type}_${receiver}_${bin_time}.log"
-                                    mv "${log_type}.log" "$new_name"
-                                    log_files_created+=("$new_name")
-                                fi
-                            done
-                            
-                            # Create combined archive
-                            if [ ${#log_files_created[@]} -gt 0 ]; then
-                                combined_name="${bin_year}_${bin_doy}_all_${receiver}_${bin_time}.tar.gz"
-                                tar -czf "$combined_name" "${log_files_created[@]}"
-                                log_msg "    Created: $combined_name"
-                                
-                                # Upload immediately to Zenodo
-                                if upload_to_zenodo "$combined_name"; then
-                                    total_files_uploaded=$((total_files_uploaded + 1))
-                                    # Remove the local file after successful upload
-                                    rm -f "$combined_name"
-                                    log_msg "    Removed local file: $combined_name"
-                                else
-                                    log_msg "    Warning: Upload failed, keeping local file: $combined_name"
-                                fi
-                                
-                                # Remove individual log files
-                                rm -f "${log_files_created[@]}"
-                                
-                                archive_count=$((archive_count + 1))
+
+                        # Copy bin file temporarily to working directory
+                        temp_bin="temp_${filename}"
+                        cp "$binfile" "$temp_bin"
+
+                        # Run binflate
+                        ./binflate -i "$temp_bin"
+
+                        # Collect log files
+                        log_files_created=()
+                        for log_type in iq iono scint navsol channel txinfo; do
+                            if [ -f "${log_type}.log" ]; then
+                                new_name="${bin_year}_${bin_doy}_${log_type}_${receiver}_${bin_time}.log"
+                                mv "${log_type}.log" "$new_name"
+                                log_files_created+=("$new_name")
                             fi
-                            
-                            # Remove temporary bin file
-                            rm -f "$temp_bin"
+                        done
+
+                        # Create combined archive
+                        if [ ${#log_files_created[@]} -gt 0 ]; then
+                            combined_name="${bin_year}_${bin_doy}_all_${receiver}_${bin_time}.tar.gz"
+                            tar -czf "$combined_name" "${log_files_created[@]}"
+                            log_msg "    Created: $combined_name"
+
+                            # Upload immediately to Zenodo
+                            if upload_to_zenodo "$combined_name"; then
+                                total_files_uploaded=$((total_files_uploaded + 1))
+                                # Remove the local file after successful upload
+                                rm -f "$combined_name"
+                                log_msg "    Removed local file: $combined_name"
+                            else
+                                log_msg "    Warning: Upload failed, keeping local file: $combined_name"
+                            fi
+
+                            # Remove individual log files
+                            rm -f "${log_files_created[@]}"
+
+                            archive_count=$((archive_count + 1))
                         fi
+
+                        # Remove temporary bin file
+                        rm -f "$temp_bin"
                     fi
                 fi
             fi
-        done
-        
+        done <<< "$bin_files_found"
+
         if [ $archive_count -gt 0 ]; then
             log_msg "Success: Created and uploaded $archive_count files for $receiver"
         else
