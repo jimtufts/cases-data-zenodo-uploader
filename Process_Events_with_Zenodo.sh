@@ -2,7 +2,7 @@
 
 # Process_Events_with_Zenodo.sh
 # Main script to process CASES events and upload to Zenodo
-# Usage: ./Process_Events_with_Zenodo.sh [events_file] [firmware_version] [zenodo_token] [zenodo_title] [zenodo_description] [bin_type]
+# Usage: ./Process_Events_with_Zenodo.sh [events_file] [firmware_version] [zenodo_token] [zenodo_title] [zenodo_description] [bin_type] [staging_dir] [max_archive_size_gb] [grid_filter]
 
 EVENTS_FILE=${1:-"List_of_events.txt"}
 FIRMWARE_VERSION=${2:-"gss1400"}
@@ -10,6 +10,9 @@ ZENODO_TOKEN=${3}
 ZENODO_TITLE=${4:-"CASES Scintillation Event Data"}
 ZENODO_DESCRIPTION=${5:-"Processed CASES scintillation event data with IQ, ionospheric, scintillation, navigation, channel, and transmitter information."}
 BIN_TYPE=${6:-"both"}  # Options: "dataout", "dataoutiq", "both"
+STAGING_DIR=${7:-"./staging_$(date +%Y%m%d_%H%M%S)"}
+MAX_ARCHIVE_SIZE_GB=${8:-45}  # Conservative limit under 50GB
+GRID_FILTER=${9:-"all"}  # Grid filter: specific grid name or "all"
 # Array of base paths to search for data
 BASE_PATHS=(
     "/data1/public/Data/cases/pfrr"
@@ -29,6 +32,9 @@ echo "Events file: $EVENTS_FILE"
 echo "Firmware: $FIRMWARE_VERSION"
 echo "Bin file type: $BIN_TYPE"
 echo "Working directory: $SCRIPT_START_DIR"
+echo "Staging directory: $STAGING_DIR"
+echo "Max archive size: ${MAX_ARCHIVE_SIZE_GB}GB"
+echo "Grid filter: $GRID_FILTER"
 echo "Zenodo token: ${ZENODO_TOKEN:+[PROVIDED]}${ZENODO_TOKEN:-[NOT PROVIDED]}"
 echo "Zenodo title: $ZENODO_TITLE"
 echo ""
@@ -36,14 +42,14 @@ echo ""
 # Check required parameters
 if [ -z "$ZENODO_TOKEN" ]; then
     echo "Error: Zenodo token is required"
-    echo "Usage: $0 [events_file] [firmware_version] [zenodo_token] [zenodo_title] [zenodo_description] [bin_type]"
+    echo "Usage: $0 [events_file] [firmware_version] [zenodo_token] [zenodo_title] [zenodo_description] [bin_type] [staging_dir] [max_archive_size_gb] [grid_filter]"
     exit 1
 fi
 
 # Validate BIN_TYPE parameter
 if [[ ! "$BIN_TYPE" =~ ^(dataout|dataoutiq|both)$ ]]; then
     echo "Error: Invalid bin_type '$BIN_TYPE'. Must be 'dataout', 'dataoutiq', or 'both'"
-    echo "Usage: $0 [events_file] [firmware_version] [zenodo_token] [zenodo_title] [zenodo_description] [bin_type]"
+    echo "Usage: $0 [events_file] [firmware_version] [zenodo_token] [zenodo_title] [zenodo_description] [bin_type] [staging_dir] [max_archive_size_gb] [grid_filter]"
     exit 1
 fi
 
@@ -53,13 +59,48 @@ if [ ! -f "$EVENTS_FILE" ]; then
     exit 1
 fi
 
+# Create staging directory
+if [ ! -d "$STAGING_DIR" ]; then
+    mkdir -p "$STAGING_DIR"
+    if [ $? -ne 0 ]; then
+        echo "Error: Could not create staging directory: $STAGING_DIR"
+        exit 1
+    fi
+    echo "Created staging directory: $STAGING_DIR"
+fi
+
 # Count total events
 TOTAL_EVENTS=$(wc -l < "$EVENTS_FILE")
 echo "Total events to process: $TOTAL_EVENTS"
 echo ""
 
 # Default receivers
-RECEIVERS=("grid108" "grid154" "grid160" "grid161" "grid162" "grid163")
+ALL_RECEIVERS=("grid108" "grid154" "grid160" "grid161" "grid162" "grid163")
+
+# Set receivers based on grid filter
+if [ "$GRID_FILTER" = "all" ]; then
+    RECEIVERS=("${ALL_RECEIVERS[@]}")
+    echo "Processing all receivers: ${RECEIVERS[*]}"
+else
+    # Check if the specified grid is valid
+    valid_grid=false
+    for grid in "${ALL_RECEIVERS[@]}"; do
+        if [ "$grid" = "$GRID_FILTER" ]; then
+            valid_grid=true
+            break
+        fi
+    done
+
+    if [ "$valid_grid" = false ]; then
+        echo "Error: Invalid grid filter '$GRID_FILTER'"
+        echo "Valid options: all, ${ALL_RECEIVERS[*]}"
+        exit 1
+    fi
+
+    RECEIVERS=("$GRID_FILTER")
+    echo "Processing only receiver: $GRID_FILTER"
+fi
+echo ""
 
 # Create log file
 LOG_FILE="processing_$(date +%Y%m%d_%H%M%S).log"
@@ -69,6 +110,26 @@ echo ""
 # Function to log messages
 log_msg() {
     echo "$1" | tee -a "$LOG_FILE"
+}
+
+# Function to get directory size in GB
+get_size_gb() {
+    local dir="$1"
+    if [ -d "$dir" ]; then
+        du -sb "$dir" | awk '{printf "%.2f", $1/1024/1024/1024}'
+    else
+        echo "0"
+    fi
+}
+
+# Function to count files in directory
+count_files() {
+    local dir="$1"
+    if [ -d "$dir" ]; then
+        find "$dir" -type f | wc -l
+    else
+        echo "0"
+    fi
 }
 
 # Debug
@@ -183,6 +244,51 @@ else
     log_msg "Error: binflate not found at $BINFLATE_PATH"
     exit 1
 fi
+
+# Function to create and upload archive from staging directory
+create_and_upload_archive() {
+    local archive_name="$1"
+    local archive_num="$2"
+
+    if [ ! -d "$STAGING_DIR" ] || [ $(count_files "$STAGING_DIR") -eq 0 ]; then
+        log_msg "No files in staging directory to archive"
+        return 0
+    fi
+
+    local staging_size=$(get_size_gb "$STAGING_DIR")
+    local file_count=$(count_files "$STAGING_DIR")
+
+    log_msg "Creating archive $archive_num: $archive_name"
+    log_msg "  Files to archive: $file_count"
+    log_msg "  Total size: ${staging_size}GB"
+
+    # Create the archive in the script start directory
+    cd "$SCRIPT_START_DIR"
+    tar -czf "$archive_name" -C "$STAGING_DIR" .
+
+    if [ $? -eq 0 ]; then
+        local archive_size=$(ls -lh "$archive_name" | awk '{print $5}')
+        log_msg "  Archive created successfully: $archive_size"
+
+        # Upload to Zenodo
+        if upload_to_zenodo "$archive_name"; then
+            log_msg "  Successfully uploaded: $archive_name"
+            log_msg "  Local archive preserved: $archive_name"
+
+            # Clear staging directory for next batch (files are now in the archive)
+            rm -rf "$STAGING_DIR"/*
+            log_msg "  Cleared staging directory"
+            return 0
+        else
+            log_msg "  Error: Failed to upload $archive_name"
+            log_msg "  Local archive preserved for retry: $archive_name"
+            return 1
+        fi
+    else
+        log_msg "  Error: Failed to create archive $archive_name"
+        return 1
+    fi
+}
 
 # Function to find all bin files for a receiver/year/doy across all base paths
 # Returns a list of unique bin files (by name), choosing the largest when duplicates exist
@@ -305,25 +411,39 @@ upload_to_zenodo() {
     fi
 }
 
-# Process each event
+# Initialize counters
 event_num=0
-total_files_uploaded=0
+total_files_processed=0
+total_archives_uploaded=0
+archive_counter=1
 
+# Convert GB limit to bytes for comparison
+MAX_ARCHIVE_SIZE_BYTES=$((MAX_ARCHIVE_SIZE_GB * 1024 * 1024 * 1024))
+
+# Process each event
 while read -r year doy signal prn start_hour start_min end_hour end_min; do
     event_num=$((event_num + 1))
-    
+
     # Skip empty lines
     [ -z "$year" ] && continue
-    
+
     # Format DOY with leading zeros
     doy_formatted=$(printf "%03d" $doy)
-    
+
+    # Create event folder name
+    event_folder="Event_$(printf "%03d" $event_num)_${year}_${doy_formatted}_L${signal}_PRN${prn}_$(printf "%02d%02d" $start_hour $start_min)-$(printf "%02d%02d" $end_hour $end_min)"
+    event_staging_dir="$STAGING_DIR/$event_folder"
+
     log_msg ""
     log_msg "=================================================="
     log_msg "Event $event_num/$TOTAL_EVENTS: Year $year, DOY $doy_formatted"
     log_msg "Time window: ${start_hour}:${start_min} - ${end_hour}:${end_min}"
     log_msg "Signal: L$signal, PRN: $prn"
+    log_msg "Event folder: $event_folder"
     log_msg "=================================================="
+
+    # Create event-specific directory
+    mkdir -p "$event_staging_dir"
     
     # Process each receiver
     for receiver in "${RECEIVERS[@]}"; do
@@ -340,14 +460,15 @@ while read -r year doy signal prn start_hour start_min end_hour end_min; do
         fi
 
         # Process bin files that match time window
-        archive_count=0
+        files_processed_this_receiver=0
         while IFS= read -r binfile; do
             if [ -f "$binfile" ]; then
                 filename=$(basename "$binfile")
 
-                # Extract time from filename (handle both dataout and dataoutiq)
+                # Extract time and type from filename
                 if [[ $filename =~ dataout(iq)?_([0-9]{4})_([0-9]{3})_([0-9]{4})\.bin ]]; then
                     # BASH_REMATCH[1] = "iq" or empty, [2] = year, [3] = doy, [4] = time
+                    file_type="${BASH_REMATCH[1]}"
                     bin_year="${BASH_REMATCH[2]}"
                     bin_doy="${BASH_REMATCH[3]}"
                     bin_time="${BASH_REMATCH[4]}"
@@ -363,7 +484,11 @@ while read -r year doy signal prn start_hour start_min end_hour end_min; do
                     fi
 
                     if [ "$in_window" = true ]; then
-                        log_msg "  Processing: $filename (hour $file_hour contains window)"
+                        if [ "$file_type" = "iq" ]; then
+                            log_msg "  Processing dataoutiq: $filename (hour $file_hour)"
+                        else
+                            log_msg "  Processing dataout: $filename (hour $file_hour)"
+                        fi
 
                         # Copy bin file temporarily to working directory
                         temp_bin="temp_${filename}"
@@ -372,36 +497,32 @@ while read -r year doy signal prn start_hour start_min end_hour end_min; do
                         # Run binflate
                         ./binflate -i "$temp_bin"
 
-                        # Collect log files
+                        # Collect and copy log files to event staging
                         log_files_created=()
-                        for log_type in iq iono scint navsol channel txinfo; do
-                            if [ -f "${log_type}.log" ]; then
-                                new_name="${bin_year}_${bin_doy}_${log_type}_${receiver}_${bin_time}.log"
-                                mv "${log_type}.log" "$new_name"
+                        if [ "$file_type" = "iq" ]; then
+                            # For dataoutiq files: process ONLY iq.log
+                            if [ -f "iq.log" ]; then
+                                new_name="${bin_year}_${bin_doy}_iq_${receiver}_${bin_time}.log"
+                                cp "iq.log" "$event_staging_dir/$new_name"
                                 log_files_created+=("$new_name")
+                                rm -f "iq.log"
                             fi
-                        done
+                        else
+                            # For dataout files: process all EXCEPT iq
+                            for log_type in iono scint navsol channel txinfo; do
+                                if [ -f "${log_type}.log" ]; then
+                                    new_name="${bin_year}_${bin_doy}_${log_type}_${receiver}_${bin_time}.log"
+                                    cp "${log_type}.log" "$event_staging_dir/$new_name"
+                                    log_files_created+=("$new_name")
+                                    rm -f "${log_type}.log"
+                                fi
+                            done
+                        fi
 
-                        # Create combined archive
                         if [ ${#log_files_created[@]} -gt 0 ]; then
-                            combined_name="${bin_year}_${bin_doy}_all_${receiver}_${bin_time}.tar.gz"
-                            tar -czf "$combined_name" "${log_files_created[@]}"
-                            log_msg "    Created: $combined_name"
-
-                            # Upload immediately to Zenodo
-                            if upload_to_zenodo "$combined_name"; then
-                                total_files_uploaded=$((total_files_uploaded + 1))
-                                # Remove the local file after successful upload
-                                rm -f "$combined_name"
-                                log_msg "    Removed local file: $combined_name"
-                            else
-                                log_msg "    Warning: Upload failed, keeping local file: $combined_name"
-                            fi
-
-                            # Remove individual log files
-                            rm -f "${log_files_created[@]}"
-
-                            archive_count=$((archive_count + 1))
+                            log_msg "    Copied ${#log_files_created[@]} files to event folder: ${log_files_created[*]}"
+                            total_files_processed=$((total_files_processed + ${#log_files_created[@]}))
+                            files_processed_this_receiver=$((files_processed_this_receiver + ${#log_files_created[@]}))
                         fi
 
                         # Remove temporary bin file
@@ -411,25 +532,59 @@ while read -r year doy signal prn start_hour start_min end_hour end_min; do
             fi
         done <<< "$bin_files_found"
 
-        if [ $archive_count -gt 0 ]; then
-            log_msg "Success: Created and uploaded $archive_count files for $receiver"
+        if [ $files_processed_this_receiver -gt 0 ]; then
+            log_msg "Success: Processed $files_processed_this_receiver files for $receiver"
         else
-            log_msg "Warning: No files created for $receiver"
+            log_msg "Warning: No files processed for $receiver"
         fi
     done
     
     log_msg "Completed event $event_num"
-    
+
+    # After completing each event, check if staging directory is getting too large
+    staging_size_bytes=$(du -sb "$STAGING_DIR" 2>/dev/null | awk '{print $1}')
+    staging_file_count=$(count_files "$STAGING_DIR")
+
+    # Create archive if we're approaching the size limit
+    if [ $staging_size_bytes -gt $MAX_ARCHIVE_SIZE_BYTES ]; then
+        archive_name="cases_data_archive_${archive_counter}.tar.gz"
+        log_msg ""
+        log_msg "Staging directory size limit reached ($(get_size_gb "$STAGING_DIR")GB, $staging_file_count files)"
+
+        if create_and_upload_archive "$archive_name" "$archive_counter"; then
+            total_archives_uploaded=$((total_archives_uploaded + 1))
+            archive_counter=$((archive_counter + 1))
+        else
+            log_msg "Error: Failed to create/upload archive $archive_counter"
+        fi
+    fi
+
 done < "$EVENTS_FILE"
+
+# Create final archive if there are remaining files in staging
+staging_file_count=$(count_files "$STAGING_DIR")
+if [ $staging_file_count -gt 0 ]; then
+    log_msg ""
+    log_msg "Creating final archive with remaining $staging_file_count files..."
+    archive_name="cases_data_archive_${archive_counter}.tar.gz"
+
+    if create_and_upload_archive "$archive_name" "$archive_counter"; then
+        total_archives_uploaded=$((total_archives_uploaded + 1))
+    else
+        log_msg "Error: Failed to create/upload final archive"
+    fi
+fi
 
 # Clean up
 rm -f binflate
+rm -rf "$STAGING_DIR"
 
 log_msg ""
 log_msg "=================================================="
 log_msg "Processing completed!"
 log_msg "Processed $event_num events"
-log_msg "Total files uploaded to Zenodo: $total_files_uploaded"
+log_msg "Total files processed: $total_files_processed"
+log_msg "Total archives uploaded to Zenodo: $total_archives_uploaded"
 log_msg "Zenodo deposition ID: $DEPOSITION_ID"
 log_msg "Check log file: $LOG_FILE"
 log_msg ""
