@@ -2,7 +2,19 @@
 
 # Process_Events_with_Zenodo.sh
 # Main script to process CASES events and upload to Zenodo
-# Usage: ./Process_Events_with_Zenodo.sh [events_file] [firmware_version] [zenodo_token] [zenodo_title] [zenodo_description] [bin_type] [staging_dir] [max_archive_size_gb] [grid_filter]
+# Usage: ./Process_Events_with_Zenodo.sh [events_file] [firmware_version] [zenodo_token] [zenodo_title] [zenodo_description] [bin_type] [staging_dir] [max_archive_size_gb] [grid_filter] [max_zenodo_deposition_gb]
+#
+# Parameters:
+#   events_file           - Input file with event list (default: "List_of_events.txt")
+#   firmware_version      - Firmware version for binflate (default: "gss1400")
+#   zenodo_token          - Zenodo API access token (required)
+#   zenodo_title          - Title for Zenodo deposition
+#   zenodo_description    - Description for Zenodo deposition
+#   bin_type              - File type: "dataout", "dataoutiq", or "both" (default: "both")
+#   staging_dir           - Working directory for staging files
+#   max_archive_size_gb   - Max size per archive file (default: 45, recommend 2-5 for reliable uploads)
+#   grid_filter           - Receiver filter: specific grid name or "all" (default: "all")
+#   max_zenodo_deposition_gb - Max size per Zenodo deposition before creating new part (default: 49, max 50)
 
 EVENTS_FILE=${1:-"List_of_events.txt"}
 FIRMWARE_VERSION=${2:-"gss1400"}
@@ -11,8 +23,10 @@ ZENODO_TITLE=${4:-"CASES Scintillation Event Data"}
 ZENODO_DESCRIPTION=${5:-"Processed CASES scintillation event data with IQ, ionospheric, scintillation, navigation, channel, and transmitter information."}
 BIN_TYPE=${6:-"both"}  # Options: "dataout", "dataoutiq", "both"
 STAGING_DIR=${7:-"./staging_$(date +%Y%m%d_%H%M%S)"}
-MAX_ARCHIVE_SIZE_GB=${8:-45}  # Conservative limit under 50GB
+MAX_ARCHIVE_SIZE_GB=${8:-2}  # Small archives for reliable uploads (large uploads timeout)
 GRID_FILTER=${9:-"all"}  # Grid filter: specific grid name or "all"
+MAX_ZENODO_DEPOSITION_GB=${10:-49}  # Max size per Zenodo deposition (under 50GB limit)
+
 # Array of base paths to search for data
 BASE_PATHS=(
     "/data1/public/Data/cases/pfrr"
@@ -34,10 +48,16 @@ echo "Bin file type: $BIN_TYPE"
 echo "Working directory: $SCRIPT_START_DIR"
 echo "Staging directory: $STAGING_DIR"
 echo "Max archive size: ${MAX_ARCHIVE_SIZE_GB}GB"
+echo "Max Zenodo deposition size: ${MAX_ZENODO_DEPOSITION_GB}GB"
 echo "Grid filter: $GRID_FILTER"
 echo "Zenodo token: ${ZENODO_TOKEN:+[PROVIDED]}${ZENODO_TOKEN:-[NOT PROVIDED]}"
 echo "Zenodo title: $ZENODO_TITLE"
 echo ""
+
+# Multi-part deposition tracking
+DEPOSITION_PART=1
+ALL_DEPOSITION_IDS=()
+MAX_ZENODO_DEPOSITION_BYTES=$((MAX_ZENODO_DEPOSITION_GB * 1024 * 1024 * 1024))
 
 # Check required parameters
 if [ -z "$ZENODO_TOKEN" ]; then
@@ -130,6 +150,114 @@ count_files() {
     else
         echo "0"
     fi
+}
+
+# Function to get current Zenodo deposition size in bytes
+# Queries the API and sums all file sizes using basic tools
+get_zenodo_deposition_size() {
+    local dep_id="$1"
+    local response
+    local total_size=0
+
+    response=$(curl -s \
+        -H "Authorization: Bearer ${ZENODO_TOKEN}" \
+        "https://zenodo.org/api/deposit/depositions/${dep_id}/files")
+
+    # Extract all filesize values and sum them using grep and awk
+    # Response format: [{"filesize": 12345, ...}, {"filesize": 67890, ...}]
+    total_size=$(echo "$response" | grep -o '"filesize": *[0-9]*' | grep -o '[0-9]*' | awk '{sum+=$1} END {print sum+0}')
+
+    echo "$total_size"
+}
+
+# Function to create a new part deposition when size limit is reached
+# Returns 0 on success, 1 on failure
+# Sets global DEPOSITION_ID and BUCKET_URL to the new deposition
+create_new_part_deposition() {
+    local part_num="$1"
+    local part_title
+
+    # Create title with part number
+    if [ $part_num -eq 1 ]; then
+        part_title="$ZENODO_TITLE"
+    else
+        part_title="$ZENODO_TITLE (Part $part_num)"
+    fi
+
+    log_msg ""
+    log_msg "=== CREATING NEW ZENODO DEPOSITION (Part $part_num) ==="
+
+    # Create empty deposition
+    local curl_output=$(mktemp)
+    local http_code=$(curl -s -w "%{http_code}" \
+        -H "Content-Type: application/json" \
+        -X POST \
+        "https://zenodo.org/api/deposit/depositions?access_token=${ZENODO_TOKEN}" \
+        -d '{}' \
+        -o "$curl_output")
+
+    local response_body=$(cat "$curl_output")
+    rm -f "$curl_output"
+
+    if [ "$http_code" != "201" ]; then
+        log_msg "Error: Failed to create new deposition (HTTP $http_code)"
+        log_msg "Response: $response_body"
+        return 1
+    fi
+
+    # Parse the response
+    local new_dep_id=$(echo "$response_body" | grep -o '"id": *[0-9]*' | head -1 | grep -o '[0-9]*')
+    local new_bucket_url=$(echo "$response_body" | grep -o '"bucket": *"[^"]*"' | cut -d'"' -f4)
+
+    if [ -z "$new_dep_id" ] || [ -z "$new_bucket_url" ]; then
+        log_msg "Error: Could not extract deposition ID or bucket URL"
+        return 1
+    fi
+
+    # Build description with links to other parts
+    local part_description="$ZENODO_DESCRIPTION"
+    if [ ${#ALL_DEPOSITION_IDS[@]} -gt 0 ]; then
+        part_description="$part_description\n\nThis is Part $part_num of a multi-part dataset. Other parts:\n"
+        local i=1
+        for prev_id in "${ALL_DEPOSITION_IDS[@]}"; do
+            part_description="$part_description- Part $i: https://zenodo.org/deposit/$prev_id\n"
+            i=$((i + 1))
+        done
+    fi
+
+    # Update metadata with part title
+    local metadata_json='{
+        "metadata": {
+            "title": "'"$part_title"'",
+            "upload_type": "dataset",
+            "description": "'"$(echo -e "$part_description")"'",
+            "creators": [{"name": "CASES Team", "affiliation": "Research Institution"}],
+            "keywords": ["CASES", "scintillation", "GPS", "ionosphere"]
+        }
+    }'
+
+    local metadata_response=$(curl -s -w "%{http_code}\n" \
+        -H "Content-Type: application/json" \
+        -X PUT \
+        "https://zenodo.org/api/deposit/depositions/${new_dep_id}?access_token=${ZENODO_TOKEN}" \
+        -d "$metadata_json")
+
+    local metadata_http_code=$(echo "$metadata_response" | tail -n 1)
+
+    if [ "$metadata_http_code" != "200" ]; then
+        log_msg "Warning: Failed to update metadata for part $part_num (HTTP $metadata_http_code)"
+    fi
+
+    # Update global variables
+    DEPOSITION_ID="$new_dep_id"
+    BUCKET_URL="$new_bucket_url"
+    ALL_DEPOSITION_IDS+=("$new_dep_id")
+
+    log_msg "Successfully created Part $part_num deposition"
+    log_msg "  Deposition ID: $DEPOSITION_ID"
+    log_msg "  Bucket URL: $BUCKET_URL"
+
+    return 0
 }
 
 # Debug
@@ -234,6 +362,10 @@ else
     log_msg "Successfully updated metadata"
 fi
 
+# Track the first deposition ID
+ALL_DEPOSITION_IDS+=("$DEPOSITION_ID")
+log_msg "Tracking deposition Part 1: $DEPOSITION_ID"
+
 # Copy binflate executable to working directory
 BINFLATE_PATH="/data1/public/Data/cases/$FIRMWARE_VERSION/binflate"
 if [ -f "$BINFLATE_PATH" ]; then
@@ -287,6 +419,55 @@ create_and_upload_archive() {
     else
         log_msg "  Error: Failed to create archive $archive_name"
         return 1
+    fi
+}
+
+# Helper function to check if a year is a leap year
+is_leap_year() {
+    local year=$1
+    if (( (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0) )); then
+        return 0  # true
+    else
+        return 1  # false
+    fi
+}
+
+# Helper function to get days in a year
+days_in_year() {
+    local year=$1
+    if is_leap_year "$year"; then
+        echo 366
+    else
+        echo 365
+    fi
+}
+
+# Helper function to get previous day (returns "year doy")
+get_prev_day() {
+    local year=$1
+    local doy=$2
+
+    if [ $doy -eq 1 ]; then
+        # Previous year, last day
+        local prev_year=$((year - 1))
+        local prev_doy=$(days_in_year $prev_year)
+        echo "$prev_year $prev_doy"
+    else
+        echo "$year $((doy - 1))"
+    fi
+}
+
+# Helper function to get next day (returns "year doy")
+get_next_day() {
+    local year=$1
+    local doy=$2
+    local max_doy=$(days_in_year $year)
+
+    if [ $doy -eq $max_doy ]; then
+        # Next year, first day
+        echo "$((year + 1)) 1"
+    else
+        echo "$year $((doy + 1))"
     fi
 }
 
@@ -356,23 +537,52 @@ find_bin_files_all_locations() {
 }
 
 # Function to upload file to Zenodo bucket
+# Automatically creates new part deposition if size limit would be exceeded
 upload_to_zenodo() {
     local file_path="$1"
     local filename=$(basename "$file_path")
-    
+
     if [ ! -f "$file_path" ]; then
         log_msg "    Error: File not found: $file_path"
         return 1
     fi
-    
-    log_msg "  Uploading $filename to Zenodo..."
-    log_msg "    File size: $(ls -lh "$file_path" | awk '{print $5}')"
+
+    # Get size of file to upload (in bytes)
+    local file_size=$(stat -c%s "$file_path" 2>/dev/null || stat -f%z "$file_path" 2>/dev/null || echo "0")
+    local file_size_human=$(ls -lh "$file_path" | awk '{print $5}')
+
+    log_msg "  Preparing to upload $filename to Zenodo..."
+    log_msg "    File size: $file_size_human ($file_size bytes)"
+
+    # Check if this upload would exceed the deposition size limit
+    local current_dep_size=$(get_zenodo_deposition_size "$DEPOSITION_ID")
+    local projected_size=$((current_dep_size + file_size))
+
+    log_msg "    Current deposition size: $((current_dep_size / 1024 / 1024)) MB"
+    log_msg "    Projected size after upload: $((projected_size / 1024 / 1024)) MB"
+    log_msg "    Max deposition size: $((MAX_ZENODO_DEPOSITION_BYTES / 1024 / 1024)) MB"
+
+    # If we would exceed the limit, create a new part deposition
+    if [ $projected_size -gt $MAX_ZENODO_DEPOSITION_BYTES ]; then
+        log_msg "    WARNING: Upload would exceed ${MAX_ZENODO_DEPOSITION_GB}GB deposition limit!"
+        log_msg "    Creating new deposition part..."
+
+        DEPOSITION_PART=$((DEPOSITION_PART + 1))
+
+        if ! create_new_part_deposition "$DEPOSITION_PART"; then
+            log_msg "    ERROR: Failed to create new part deposition"
+            return 1
+        fi
+
+        log_msg "    Now uploading to Part $DEPOSITION_PART (Deposition ID: $DEPOSITION_ID)"
+    fi
+
     log_msg "    Target URL: ${BUCKET_URL}/${filename}"
-    
+
     # Create temporary file for curl output
     CURL_OUTPUT=$(mktemp)
     CURL_HTTP_CODE=$(mktemp)
-    
+
     # Use curl to upload directly to bucket with more detailed error reporting
     curl -s -w "%{http_code}" \
         -X PUT \
@@ -381,22 +591,22 @@ upload_to_zenodo() {
         "${BUCKET_URL}/${filename}?access_token=${ZENODO_TOKEN}" \
         -o "$CURL_OUTPUT" \
         2>"$CURL_HTTP_CODE.err" >"$CURL_HTTP_CODE"
-    
+
     local curl_exit_code=$?
     local http_code=$(cat "$CURL_HTTP_CODE" 2>/dev/null)
     local curl_stderr=$(cat "$CURL_HTTP_CODE.err" 2>/dev/null)
     local response_body=$(cat "$CURL_OUTPUT" 2>/dev/null)
-    
+
     # Debug output
     log_msg "    Curl exit code: $curl_exit_code"
     log_msg "    HTTP code: '$http_code'"
-    
+
     if [ $curl_exit_code -ne 0 ]; then
         log_msg "    Curl error: $curl_stderr"
         rm -f "$CURL_OUTPUT" "$CURL_HTTP_CODE" "$CURL_HTTP_CODE.err"
         return 1
     fi
-    
+
     if [ "$http_code" = "200" ] || [ "$http_code" = "201" ]; then
         log_msg "    Successfully uploaded: $filename"
         log_msg "    Response: $response_body"
@@ -430,6 +640,34 @@ while read -r year doy signal prn start_hour start_min end_hour end_min; do
     # Format DOY with leading zeros
     doy_formatted=$(printf "%03d" $doy)
 
+    # Add 1-hour buffer before and after event (with cross-day handling)
+    need_prev_day=false
+    need_next_day=false
+    prev_day_year=""
+    prev_day_doy=""
+    next_day_year=""
+    next_day_doy=""
+
+    # Calculate buffered hours for the main day
+    buffered_start_hour=$((start_hour - 1))
+    buffered_end_hour=$((end_hour + 1))
+
+    # Check if we need previous day data (buffer extends before midnight)
+    if [ $buffered_start_hour -lt 0 ]; then
+        need_prev_day=true
+        read prev_day_year prev_day_doy <<< $(get_prev_day $year $doy)
+        prev_day_doy_formatted=$(printf "%03d" $prev_day_doy)
+        buffered_start_hour=0  # Cap at 0 for main day
+    fi
+
+    # Check if we need next day data (buffer extends past midnight)
+    if [ $buffered_end_hour -gt 23 ]; then
+        need_next_day=true
+        read next_day_year next_day_doy <<< $(get_next_day $year $doy)
+        next_day_doy_formatted=$(printf "%03d" $next_day_doy)
+        buffered_end_hour=23  # Cap at 23 for main day
+    fi
+
     # Create event folder name
     event_folder="Event_$(printf "%03d" $event_num)_${year}_${doy_formatted}_L${signal}_PRN${prn}_$(printf "%02d%02d" $start_hour $start_min)-$(printf "%02d%02d" $end_hour $end_min)"
     event_staging_dir="$STAGING_DIR/$event_folder"
@@ -438,6 +676,13 @@ while read -r year doy signal prn start_hour start_min end_hour end_min; do
     log_msg "=================================================="
     log_msg "Event $event_num/$TOTAL_EVENTS: Year $year, DOY $doy_formatted"
     log_msg "Time window: ${start_hour}:${start_min} - ${end_hour}:${end_min}"
+    log_msg "Buffered window: ${buffered_start_hour}:00 - ${buffered_end_hour}:59 (+/- 1 hour)"
+    if [ "$need_prev_day" = true ]; then
+        log_msg "  + Previous day: ${prev_day_year}/${prev_day_doy_formatted} hour 23"
+    fi
+    if [ "$need_next_day" = true ]; then
+        log_msg "  + Next day: ${next_day_year}/${next_day_doy_formatted} hour 00"
+    fi
     log_msg "Signal: L$signal, PRN: $prn"
     log_msg "Event folder: $event_folder"
     log_msg "=================================================="
@@ -454,8 +699,27 @@ while read -r year doy signal prn start_hour start_min end_hour end_min; do
         log_msg "Searching for bin files across all data locations..."
         bin_files_found=$(find_bin_files_all_locations "$year" "$doy_formatted" "$receiver")
 
-        if [ -z "$bin_files_found" ]; then
-            log_msg "Warning: No bin files found for $receiver on $year/$doy_formatted"
+        # Also search previous day if buffer extends before midnight
+        prev_day_bin_files=""
+        if [ "$need_prev_day" = true ]; then
+            log_msg "Searching previous day ${prev_day_year}/${prev_day_doy_formatted} for hour 23 data..."
+            prev_day_bin_files=$(find_bin_files_all_locations "$prev_day_year" "$prev_day_doy_formatted" "$receiver")
+        fi
+
+        # Also search next day if buffer extends past midnight
+        next_day_bin_files=""
+        if [ "$need_next_day" = true ]; then
+            log_msg "Searching next day ${next_day_year}/${next_day_doy_formatted} for hour 00 data..."
+            next_day_bin_files=$(find_bin_files_all_locations "$next_day_year" "$next_day_doy_formatted" "$receiver")
+        fi
+
+        # Combine all bin files
+        all_bin_files="$bin_files_found"
+        [ -n "$prev_day_bin_files" ] && all_bin_files="$all_bin_files"$'\n'"$prev_day_bin_files"
+        [ -n "$next_day_bin_files" ] && all_bin_files="$all_bin_files"$'\n'"$next_day_bin_files"
+
+        if [ -z "$all_bin_files" ]; then
+            log_msg "Warning: No bin files found for $receiver on $year/$doy_formatted (including adjacent days)"
             continue
         fi
 
@@ -475,12 +739,25 @@ while read -r year doy signal prn start_hour start_min end_hour end_min; do
                     time_str="$bin_time"
                     file_hour=$((10#${time_str:0:2}))
 
-                    # Check if file hour overlaps with time window
+                    # Check if file hour overlaps with buffered time window (with cross-day handling)
                     in_window=false
-                    if [ $file_hour -eq $start_hour ] || [ $file_hour -eq $end_hour ]; then
-                        in_window=true
-                    elif [ $file_hour -gt $start_hour ] && [ $file_hour -lt $end_hour ]; then
-                        in_window=true
+
+                    # Check if this is a file from the main event day
+                    if [ "$bin_year" = "$year" ] && [ "$bin_doy" = "$doy_formatted" ]; then
+                        # Main day: use buffered start/end hours
+                        if [ $file_hour -ge $buffered_start_hour ] && [ $file_hour -le $buffered_end_hour ]; then
+                            in_window=true
+                        fi
+                    # Check if this is a file from the previous day (only want hour 23)
+                    elif [ "$need_prev_day" = true ] && [ "$bin_year" = "$prev_day_year" ] && [ "$bin_doy" = "$prev_day_doy_formatted" ]; then
+                        if [ $file_hour -eq 23 ]; then
+                            in_window=true
+                        fi
+                    # Check if this is a file from the next day (only want hour 00)
+                    elif [ "$need_next_day" = true ] && [ "$bin_year" = "$next_day_year" ] && [ "$bin_doy" = "$next_day_doy_formatted" ]; then
+                        if [ $file_hour -eq 0 ]; then
+                            in_window=true
+                        fi
                     fi
 
                     if [ "$in_window" = true ]; then
@@ -530,7 +807,7 @@ while read -r year doy signal prn start_hour start_min end_hour end_min; do
                     fi
                 fi
             fi
-        done <<< "$bin_files_found"
+        done <<< "$all_bin_files"
 
         if [ $files_processed_this_receiver -gt 0 ]; then
             log_msg "Success: Processed $files_processed_this_receiver files for $receiver"
@@ -585,10 +862,24 @@ log_msg "Processing completed!"
 log_msg "Processed $event_num events"
 log_msg "Total files processed: $total_files_processed"
 log_msg "Total archives uploaded to Zenodo: $total_archives_uploaded"
-log_msg "Zenodo deposition ID: $DEPOSITION_ID"
+log_msg "Total Zenodo depositions created: ${#ALL_DEPOSITION_IDS[@]}"
 log_msg "Check log file: $LOG_FILE"
 log_msg ""
-log_msg "To publish the deposition, visit:"
-log_msg "https://zenodo.org/deposit/$DEPOSITION_ID"
-log_msg "Or use the publish API endpoint"
+
+if [ ${#ALL_DEPOSITION_IDS[@]} -eq 1 ]; then
+    log_msg "Zenodo deposition ID: ${ALL_DEPOSITION_IDS[0]}"
+    log_msg ""
+    log_msg "To publish the deposition, visit:"
+    log_msg "https://zenodo.org/deposit/${ALL_DEPOSITION_IDS[0]}"
+else
+    log_msg "Multi-part dataset created (${#ALL_DEPOSITION_IDS[@]} parts):"
+    part_num=1
+    for dep_id in "${ALL_DEPOSITION_IDS[@]}"; do
+        log_msg "  Part $part_num: https://zenodo.org/deposit/$dep_id"
+        part_num=$((part_num + 1))
+    done
+    log_msg ""
+    log_msg "To publish all parts, visit each deposition link above"
+    log_msg "Note: Remember to update metadata to cross-reference all parts before publishing"
+fi
 log_msg "=================================================="
